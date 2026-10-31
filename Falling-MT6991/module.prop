@@ -4,3 +4,4 @@ version=v3.7.0
 versionCode=3700
 author=弦起悲歌赴寒江
 description=天玑9400智能调度模块: 按温度/整机与分簇占用率/帧率/前台应用自动选档, 无需手动配置; 带决策历史与崩溃自愈; 游戏可二选一(官方让路/模块接管); 另有智能温控 + 触控采样率 + 应用策略 + ZRAM + WebUI(全中文, 卸载零残留); 游戏 CPU 交官方调度不干预
+updateJson=https://raw.githubusercontent.com/Unlndm/Falling-MT6991/main/Falling-MT6991/update.json
