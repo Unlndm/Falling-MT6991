@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Falling-MT6991 调度中心</title>
+<link rel="stylesheet" href="theme.css?v=3">
+<link rel="stylesheet" href="glass-liquid.css?v=3">
+</head>
+<body data-theme="light" data-glass="on">
+
+<!-- ============ 液态玻璃: 背景墙 ============
+     这张画布由 glass-liquid.js 绘制渐变壁纸, 同时作为 WebGL 折射的采样源。
+     每块玻璃(.g)内部会插入一张 <canvas class="glass-surface">,
+     画的是「背景被圆角 SDF 折射 + 光谱色散 + 边缘高光」的结果。
+     WebGL 不可用时脚本会退回纯 CSS 模糊(见 glass-liquid.css 的 .glass-flat)。 -->
+<canvas id="glass-canvas" aria-hidden="true"></canvas>
+
+<!-- ============ 顶栏 ============ -->
+<header class="top-bar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg>
+    </span>
+    <span class="brand-copy">
+      <b>Falling</b>
+      <small>MT6991 智能调度</small>
+    </span>
+  </div>
+  <div class="top-actions">
+    <button class="status-pill g" id="daemon-pill" data-role="pill" data-radius="999"
+            data-state="connecting" type="button" aria-live="polite">
+      <i class="dot" aria-hidden="true"></i><span id="daemon-state">检测中…</span>
+    </button>
+    <button class="chrome-btn g" id="refresh-btn" data-role="pill" data-radius="999"
+            type="button" aria-label="刷新">
+      <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7M21 3v6h-6"/></svg>
+    </button>
+  </div>
+</header>
+
+<!-- ============ 内容区 (4 个平级 page) ============ -->
+<main class="content" id="main" tabindex="-1">
+
+  <!-- ============================================================
+       Page 1 · 概览
+       学 NovaSched: Hero 卡片(当前状态) + 分区标题带状态 + 卡片网格
+       原创: 闭环仪表(压力环 + 三段条) + 分簇热力
+       ============================================================ -->
+  <section class="page active" id="page-overview" aria-label="概览">
+
+    <!-- Hero: 当前是谁在控 + 关键指标 -->
+    <article class="hero-card g" data-role="course" data-radius="30" id="hero-card" tabindex="0">
+      <div class="hero-top">
+        <span class="hero-label" id="control-val">读取中…</span>
+        <span class="hero-status" id="guard-sub">--</span>
+      </div>
+      <div class="hero-mode" id="mt-scheme-name">--</div>
+      <p class="hero-sub" id="mt-smart">等待守护进程上报…</p>
+      <div class="hero-metrics">
+        <div class="hero-metric">
+          <b id="hero-temp">--°</b>
+          <span>CPU 温度</span>
+        </div>
+        <div class="hero-metric">
+          <b id="mt-cpu-load">--</b>
+          <span>整机占用</span>
+        </div>
+        <div class="hero-metric">
+          <b id="mt-cpu-freq">--</b>
+          <span>大核频率</span>
+        </div>
+      </div>
+      <div class="hero-meta">
+        <span class="soc-chip">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/></svg>
+          <span id="mt-tools-model">天玑 9400</span>
+        </span>
+        <span id="mt-scheme-th">调度层 --</span>
+      </div>
+    </article>
+
+    <!-- 原创: 帧率闭环仪表 -->
+    <div class="section-divider">
+      <span>帧率闭环</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="loop-state">等待采样</span>
+    </div>
+    <article class="loop-panel g" data-role="panel" data-radius="22">
+      <div class="loop-head">
+        <b>追帧压力</b>
+        <span id="loop-explain">帧率富余则收紧，帧率不足则放开</span>
+      </div>
+      <div class="loop-body">
+        <div class="loop-ring">
+          <svg viewBox="0 0 76 76" aria-hidden="true">
+            <circle class="track" cx="38" cy="38" r="33"/>
+            <circle class="arc" id="loop-arc" cx="38" cy="38" r="33"
+                    stroke-dasharray="207.3" stroke-dashoffset="207.3"/>
+          </svg>
+          <span class="lv"><span id="loop-press">--</span><small>压力</small></span>
+        </div>
+        <div class="loop-bars">
+          <div class="loop-bar-row">
+            <span class="loop-bar-lbl"><span>帧率达标率</span><b id="loop-fps">--</b></span>
+            <span class="loop-track"><i id="loop-fps-bar"></i></span>
+          </div>
+          <div class="loop-bar-row">
+            <span class="loop-bar-lbl"><span>大核占用</span><b id="loop-prime">--</b></span>
+            <span class="loop-track"><i id="loop-prime-bar"></i></span>
+          </div>
+          <div class="loop-bar-row">
+            <span class="loop-bar-lbl"><span>CPU 争用</span><b id="loop-psi">--</b></span>
+            <span class="loop-track"><i id="loop-psi-bar"></i></span>
+          </div>
+          <div class="loop-bar-row">
+            <span class="loop-bar-lbl"><span>温控降额</span><b id="loop-ratio">--</b></span>
+            <span class="loop-track"><i id="loop-ratio-bar"></i></span>
+          </div>
+        </div>
+      </div>
+      <div class="exec-steps" id="exec-steps" aria-label="执行器档位">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <p class="section-note" id="loop-note">
+        执行器档位 L0~L4 决定 sugov_ext 升降频速率与 hmbird 阈值。
+        档位越高升频越快、boost 阈值越低；追帧压力连续 2 轮一致才换，且至少隔 20 秒。
+      </p>
+    </article>
+
+    <!-- 调度倾向: 学 NovaSched 的 mode-grid (图标 + 标题 + 白话说明 + 打勾) -->
+    <div class="section-divider">
+      <span>调度倾向</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="tend-state">省电</span>
+    </div>
+    <div class="mode-grid three" id="tendency-seg" role="group" aria-label="调度倾向">
+      <button class="mode-card g" data-role="course" data-radius="22" data-tend="save"
+              data-state="idle" type="button" aria-pressed="false">
+        <span class="mode-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M20 4C8 3 3 9 7 16c6 6 13 0 13-12ZM4 21 16 9"/></svg>
+        </span>
+        <span class="mode-copy">
+          <b>省电</b>
+          <small>更容易落到省电档，更难升到性能档</small>
+        </span>
+        <svg class="mode-check" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>
+      </button>
+      <button class="mode-card g" data-role="course" data-radius="22" data-tend="balance"
+              data-state="idle" type="button" aria-pressed="false">
+        <span class="mode-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 3v18M5 7h14M3 14l3-7 3 7M15 14l3-7 3 7M8 21h8M3 14h6M15 14h6"/></svg>
+        </span>
+        <span class="mode-copy">
+          <b>均衡</b>
+          <small>不偏不倚，按现场信号自动判断</small>
+        </span>
+        <svg class="mode-check" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>
+      </button>
+      <button class="mode-card g" data-role="course" data-radius="22" data-tend="perf"
+              data-state="idle" type="button" aria-pressed="false">
+        <span class="mode-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg>
+        </span>
+        <span class="mode-copy">
+          <b>性能</b>
+          <small>更容易升到性能档，更难掉到省电档</small>
+        </span>
+        <svg class="mode-check" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>
+      </button>
+    </div>
+    <p class="section-note">
+      倾向只给自动决策加偏置，<b>不锁档位</b>。息屏降档、高温强制降档、应用策略、
+      游戏保底这些硬规则不受倾向影响。
+    </p>
+
+    <!-- 原创: 分簇热力 -->
+    <div class="section-divider">
+      <span>分簇占用</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="cluster-state">5 秒窗口</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:15px 16px">
+      <div class="cluster-heat" id="cluster-heat">
+        <div class="cluster-row">
+          <span class="cluster-name">小核</span>
+          <span class="cluster-track"><i id="cl0-bar"></i></span>
+          <span class="cluster-val" id="cl0-val">--</span>
+        </div>
+        <div class="cluster-row">
+          <span class="cluster-name">中核</span>
+          <span class="cluster-track"><i id="cl1-bar"></i></span>
+          <span class="cluster-val" id="cl1-val">--</span>
+        </div>
+        <div class="cluster-row">
+          <span class="cluster-name">大核</span>
+          <span class="cluster-track"><i id="cl2-bar"></i></span>
+          <span class="cluster-val" id="cl2-val">--</span>
+        </div>
+      </div>
+      <p class="section-note">
+        整机占用看不出瓶颈在哪：小核吃满、大核空转时加频率收益很小；大核吃满才是真的上限不够。
+        模块只在「大核吃满」时额外加权，不会因为小核忙就盲目升档。
+      </p>
+    </article>
+
+    <!-- 状态速览 -->
+    <div class="section-divider">
+      <span>硬件状态</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="hw-state">每 2 秒刷新</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:2px 16px 10px">
+      <div class="kv" id="hw-overview"><span class="muted">读取中…</span></div>
+    </article>
+
+    <!-- CPU / GPU 实时仪表 -->
+    <div class="section-divider">
+      <span>频率与负载</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="dash-state">实时</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:14px 16px">
+      <div class="cpu-dash" id="cpu-dash"></div>
+      <div class="gpu-dash" id="gpu-dash"></div>
+    </article>
+
+    <!-- 近期事件 -->
+    <div class="section-divider">
+      <span>近期事件</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="event-count">--</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:4px 12px 12px">
+      <div class="log-list" id="event-log"></div>
+    </article>
+  </section>
+
+  <!-- ============================================================
+       Page 2 · 调度
+       学 NovaSched 的 rules 页: 分区标题带计数 + 卡片列表 + 底部动作按钮
+       ============================================================ -->
+  <section class="page" id="page-schedule" aria-label="调度">
+
+    <p class="page-intro">
+      档位由模块按温度 / 占用率 / 帧率 / 前台应用 / 屏态自动决定，不需要手动设置。
+    </p>
+
+    <!-- 当前决策 -->
+    <div class="section-divider">
+      <span>当前决策</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="decision-state">--</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:2px 16px 10px">
+      <div class="kv" id="smart-info"><span class="muted">读取中…</span></div>
+    </article>
+
+    <!-- 游戏调度归属 -->
+    <div class="section-divider">
+      <span>游戏调度</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="gmode-state">--</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:14px 16px">
+      <div class="segmented" id="game-mode-seg" role="group" aria-label="游戏调度归属">
+        <button data-gmode="official" class="active" type="button">官方调度</button>
+        <button data-gmode="module" type="button">模块调度</button>
+      </div>
+      <div class="kv" id="game-mode-info"></div>
+    </article>
+
+    <!-- 决策规则 -->
+    <div class="section-divider">
+      <span>决策规则</span><i aria-hidden="true"></i>
+      <span class="sec-time">硬规则优先</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:2px 16px 10px">
+      <div class="kv">
+        <div class="kv-row"><span>息屏</span><b>极限省电</b></div>
+        <div class="kv-row"><span>游戏（名单命中）</span><b>按上方「游戏调度」</b></div>
+        <div class="kv-row"><span>应用策略</span><b>按 apps.conf 指定档位</b></div>
+        <div class="kv-row"><span>其余</span><b>温度 + 占用率 + 帧率综合评分</b></div>
+        <div class="kv-row"><span>评分倾向</span><b id="rule-tendency">省电</b></div>
+      </div>
+    </article>
+
+    <!-- 调度层参数明细 -->
+    <div class="section-divider">
+      <span>调度层参数</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="sched-param-state">--</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:2px 16px 10px">
+      <div class="kv" id="sched-info"><span class="muted">读取中…</span></div>
+    </article>
+
+    <!-- 原创: 决策链时间轴 -->
+    <div class="section-divider">
+      <span>决策链</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="trace-count">最近 8 次</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:6px 16px 14px">
+      <div class="decision-timeline" id="smart-trace"><span class="muted">读取中…</span></div>
+    </article>
+
+    <!-- 驻留统计 -->
+    <div class="section-divider">
+      <span>档位驻留</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="stats-state">--</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:2px 16px 10px">
+      <div class="kv" id="smart-stats"><span class="muted">读取中…</span></div>
+    </article>
+
+    <!-- 调度层节点 -->
+    <div class="section-divider">
+      <span>调度层节点</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="sched-node-state">探测中</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:14px 16px">
+      <p class="desc" style="margin:0 0 8px">本机内核真实存在的调度节点。总结：<b id="sched-layer-sum">读取中…</b></p>
+      <div class="kv" id="sched-nodes"><span class="muted">打开本页自动探测…</span></div>
+      <pre class="log" id="sched-node-raw" hidden></pre>
+      <div class="row gap" style="margin-top:10px">
+        <button class="btn sm" id="sched-probe-btn" style="flex:1">重新探测</button>
+        <button class="btn sm" id="sched-check-btn" style="flex:1">档位自检</button>
+      </div>
+      <pre class="log" id="sched-check-out" hidden></pre>
+    </article>
+
+    <!-- 运行状态 -->
+    <div class="section-divider">
+      <span>运行状态</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="daemon-state2">--</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:2px 16px 10px">
+      <div class="kv" id="daemon-info"><span class="muted">读取中…</span></div>
+      <div class="kv-row" style="margin-top:4px">
+        <span>后台守护</span>
+        <button class="switch" id="daemon-toggle" role="switch" aria-checked="true"
+                aria-label="后台守护" type="button"><span></span></button>
+      </div>
+    </article>
+  </section>
+
+  <!-- ============================================================
+       Page 3 · 触控
+       学 NovaSched 的 rules 页: 搜索框 + 计数 + 列表 + 添加按钮
+       ============================================================ -->
+  <section class="page" id="page-touch" aria-label="触控">
+
+    <div class="section-divider">
+      <span>触控采样率</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="touch-state-top">--</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:14px 16px">
+      <div class="kv-row">
+        <span>启用触控调度</span>
+        <button class="switch" id="touch-toggle" role="switch" aria-checked="true"
+                aria-label="启用触控调度" type="button"><span></span></button>
+      </div>
+      <div class="field">
+        <label class="lbl">日常采样率</label>
+        <select class="sel" id="touch-daily"></select>
+      </div>
+      <div class="field">
+        <label class="lbl">游戏采样率</label>
+        <select class="sel" id="touch-game"></select>
+      </div>
+      <div class="field">
+        <label class="lbl">游戏包名（逗号分隔，用户自维护）</label>
+        <input class="inp" id="touch-pkgs" placeholder="com.tencent.tmgp.sgame,com.miHoYo.Yuanshen">
+        <p class="desc">命中这些包（前台打开或进程存活）时切游戏采样率档，
+          CPU 交给谁由「调度 → 游戏调度」决定。名单改后 60s 内生效，
+          退出游戏需连续 15s 未命中才算结束。</p>
+      </div>
+      <div class="field" id="touch-custom-wrap" hidden>
+        <label class="lbl">自定义命令</label>
+        <input class="inp" id="touch-custom" placeholder="touchHidlTest -c wo 0 182 258">
+      </div>
+      <button class="btn block" id="touch-save">保存（守护进程 5s 内生效）</button>
+    </article>
+
+    <!-- 专属采样率 -->
+    <div class="section-divider">
+      <span>专属采样率</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="at-count">--</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:12px 12px 14px">
+      <div class="rule-list" id="app-touch-list"></div>
+      <div class="rule-add">
+        <input class="inp" id="at-pkg" placeholder="包名">
+        <select class="sel" id="at-code">
+          <option value="1">240Hz (1)</option>
+          <option value="12c">360Hz 一加11/12 (12c)</option>
+          <option value="c">360Hz 真我 (c)</option>
+          <option value="360">360Hz (360)</option>
+          <option value="258">600Hz (258)</option>
+        </select>
+        <button class="btn sm" id="at-add">添加</button>
+      </div>
+    </article>
+
+    <!-- 应用策略 -->
+    <div class="section-divider">
+      <span>应用策略</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="policy-count">--</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:12px 12px 14px">
+      <input class="inp app-search" id="policy-search" placeholder="搜索包名或应用名">
+      <div class="rule-list" id="app-policy-list"></div>
+      <button class="btn block" id="policy-add">添加应用策略</button>
+    </article>
+
+    <!-- 应用库 -->
+    <div class="section-divider">
+      <span>应用库</span><i aria-hidden="true"></i>
+      <span class="sec-time" id="app-count">点刷新加载</span>
+    </div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:14px 16px">
+      <div class="segmented" id="apps-tab" role="group" aria-label="应用类型">
+        <button data-tab="user" class="active" type="button">用户应用</button>
+        <button data-tab="system" type="button">系统应用</button>
+      </div>
+      <input class="inp app-search" id="apps-search" placeholder="搜索包名">
+      <div class="app-list" id="app-list"><span class="muted">点「刷新」加载应用列表</span></div>
+      <button class="btn block" id="apps-reload">刷新应用列表</button>
+    </article>
+  </section>
+
+  <!-- ============================================================
+       Page 4 · 我的
+       学 NovaSched 的 settings 页: 大标题 + 分组 setting-row + 开关
+       ============================================================ -->
+  <section class="page settings-page" id="page-settings" aria-label="我的">
+    <h2 class="settings-title">设置</h2>
+
+    <div class="settings-label">外观</div>
+    <article class="settings-group g" data-role="settings" data-radius="18">
+      <div class="setting-row">
+        <span class="setting-icon purple" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 0 18h1a2 2 0 0 0 0-4h-1a1.5 1.5 0 0 1 0-3h4a5 5 0 0 0 0-10z"/></svg>
+        </span>
+        <span class="row-copy">
+          <b>主题模式</b>
+          <small>即刻生效，重启后保持</small>
+        </span>
+      </div>
+      <div class="setting-row">
+        <div class="theme-picker" id="theme-picker" style="width:100%">
+          <button class="theme-swatch" data-theme="light" style="--sw:#e9eef5" aria-pressed="true" type="button">
+            <span class="sw-dot"></span>浅色</button>
+          <button class="theme-swatch" data-theme="dark" style="--sw:#0d1015" aria-pressed="false" type="button">
+            <span class="sw-dot"></span>深色</button>
+        </div>
+      </div>
+      <div class="setting-row">
+        <span class="setting-icon blue" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 3C9 7 5 10 5 14a7 7 0 0 0 14 0c0-4-4-7-7-11Z"/></svg>
+        </span>
+        <span class="row-copy">
+          <b>液态玻璃</b>
+          <small id="glass-note">折射、模糊与边缘色散</small>
+        </span>
+        <button class="switch" id="glass-toggle" role="switch" aria-checked="true"
+                aria-label="液态玻璃" type="button"><span></span></button>
+      </div>
+    </article>
+
+    <div class="settings-label">省电</div>
+    <article class="settings-group g" data-role="settings" data-radius="18">
+      <div class="setting-row">
+        <span class="setting-icon green" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><rect x="2" y="7" width="16" height="10" rx="2"/><path d="M22 10v4"/><path d="M6 11v2"/><path d="M10 11v2"/></svg>
+        </span>
+        <span class="row-copy">
+          <b>极致省电</b>
+          <small id="extreme-note">压低频率与 GPU 上限、锁住升频节奏</small>
+        </span>
+        <button class="switch" id="extreme-toggle" role="switch" aria-checked="false"
+                aria-label="极致省电" type="button"><span></span></button>
+      </div>
+      <div class="kv" id="extreme-state"></div>
+    </article>
+
+    <div class="settings-label">运行</div>
+    <article class="settings-group g" data-role="settings" data-radius="18">
+      <div class="setting-row">
+        <span class="setting-icon green" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+        </span>
+        <span class="row-copy">
+          <b>系统通知</b>
+          <small>换档时推送一条</small>
+        </span>
+        <button class="switch" id="notify-toggle" role="switch" aria-checked="true"
+                aria-label="系统通知" type="button"><span></span></button>
+      </div>
+      <button class="setting-row" id="notify-test" type="button">
+        <span class="setting-icon orange" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        </span>
+        <span class="row-copy"><b>发送测试通知</b><small>验证通知通道是否通</small></span>
+        <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>
+      </button>
+      <button class="setting-row" id="detect-btn" type="button">
+        <span class="setting-icon green" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+        </span>
+        <span class="row-copy"><b>重新检测设备</b><small>重读机型与节点信息</small></span>
+        <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>
+      </button>
+    </article>
+
+    <div class="settings-label">配置管理</div>
+    <article class="settings-group g" data-role="settings" data-radius="18">
+      <button class="setting-row" id="backup-btn" type="button">
+        <span class="setting-icon blue" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5M12 15V3"/></svg>
+        </span>
+        <span class="row-copy"><b>备份配置</b><small>导出到下载目录</small></span>
+        <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>
+      </button>
+      <button class="setting-row" id="cfg-export" type="button">
+        <span class="setting-icon orange" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+        </span>
+        <span class="row-copy"><b>导出配置</b><small>复制全部配置项</small></span>
+        <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>
+      </button>
+      <button class="setting-row" id="cfg-import" type="button">
+        <span class="setting-icon purple" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 8l5-5 5 5M12 3v12"/></svg>
+        </span>
+        <span class="row-copy"><b>导入配置</b><small>从剪贴板恢复</small></span>
+        <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>
+      </button>
+      <button class="setting-row" id="cfg-reset" type="button">
+        <span class="setting-icon red" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7M3 3v6h6"/></svg>
+        </span>
+        <span class="row-copy"><b>恢复默认配置</b><small>清空自定义，回到出厂</small></span>
+        <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>
+      </button>
+    </article>
+
+    <div class="settings-label">内存优化</div>
+    <article class="settings-group g" data-role="settings" data-radius="18" style="padding:14px 16px">
+      <div class="kv-row">
+        <span>ZRAM 内存优化</span>
+        <button class="switch" id="zram-toggle" role="switch" aria-checked="false"
+                aria-label="ZRAM 内存优化" type="button"><span></span></button>
+      </div>
+      <div class="kv" id="zram-dash"><span class="muted">读取中…</span></div>
+      <div class="kv-row"><span>当前内存档</span><b id="zram-tier">--</b></div>
+      <div class="kv" id="zram-probe"></div>
+      <div class="row gap" style="margin-top:10px">
+        <button class="btn sm" id="zram-expand" style="flex:1">展开参数编辑</button>
+      </div>
+      <div id="zram-editor" hidden style="margin-top:12px">
+        <div class="segmented" id="zram-editor-tabs" role="group" aria-label="内存档">
+          <button data-zramtab="24g" type="button">24G</button>
+          <button data-zramtab="16g" class="active" type="button">16G</button>
+          <button data-zramtab="12g" type="button">12G</button>
+        </div>
+        <div class="tune-grid" id="zram-params"></div>
+        <div class="row gap" style="margin-top:10px">
+          <button class="btn sm" id="zram-save" style="flex:1">保存当前档</button>
+          <button class="btn sm" id="zram-reload" style="flex:1">重新读取</button>
+        </div>
+      </div>
+    </article>
+
+    <div class="settings-label">日志与诊断</div>
+    <article class="settings-group g" data-role="settings" data-radius="18" style="padding:14px 16px">
+      <div class="kv-row">
+        <span>详细日志（每轮调度）</span>
+        <button class="switch" id="debug-toggle" role="switch" aria-checked="false"
+                aria-label="详细日志" type="button"><span></span></button>
+      </div>
+      <div class="row gap" style="margin-top:10px">
+        <button class="btn sm" id="log-clear" style="flex:1">清空日志</button>
+      </div>
+      <pre class="log" id="log-view"></pre>
+    </article>
+
+    <div class="settings-label">设备信息</div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:2px 16px 10px">
+      <div class="kv">
+        <div class="kv-row"><span>内核版本</span><b id="s-kern">--</b></div>
+        <div class="kv-row"><span>模块版本号</span><b id="s-ver">--</b></div>
+        <div class="kv-row"><span>系统指纹</span><b id="s-fp">--</b></div>
+        <div class="kv-row"><span>SELinux 状态</span><b id="s-selinux">--</b></div>
+        <div class="kv-row"><span>CPU 型号</span><b id="cpu-model">--</b></div>
+        <div class="kv-row"><span>CPU 架构</span><b id="cpu-arch">--</b></div>
+        <div class="kv-row"><span>系统负载</span><b id="loadavg">--</b></div>
+        <div class="kv-row"><span>CPU 温度</span><b id="cpu-temp">--</b></div>
+        <div class="kv-row"><span>CPU 温度 (采样)</span><b id="t-cpu">--</b></div>
+        <div class="kv-row"><span>GPU 温度</span><b id="t-gpu">--</b></div>
+        <div class="kv-row"><span>电池温度</span><b id="t-batt">--</b></div>
+        <div class="kv-row"><span>电池循环</span><b id="t-cycle">--</b></div>
+        <div class="kv-row"><span>更新时间</span><b id="t-time">--</b></div>
+      </div>
+    </article>
+
+    <div class="settings-label">触控配置预览</div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:4px 12px 12px">
+      <pre class="log" id="touch-preview"></pre>
+    </article>
+
+    <div class="settings-label">更新日志</div>
+    <article class="g" data-role="panel" data-radius="22" style="padding:4px 12px 12px">
+      <pre class="log" id="changelog-view">加载中…</pre>
+    </article>
+  </section>
+</main>
+
+<!-- ============ 底部胶囊 dock ============ -->
+<div class="dock-wrap" id="dock-wrap">
+  <nav class="dock g" data-role="dock" data-radius="999" aria-label="页面切换">
+    <span class="dock-indicator g" data-role="lens" data-radius="999" aria-hidden="true"></span>
+    <button data-page="overview" aria-current="page" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+      概览
+    </button>
+    <button data-page="schedule" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M5 7h14M3 14l3-7 3 7M15 14l3-7 3 7M8 21h8"/></svg>
+      调度
+    </button>
+    <button data-page="touch" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M8 7l4-4 4 4M8 17l4 4 4-4"/></svg>
+      触控
+    </button>
+    <button data-page="settings" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+      我的
+    </button>
+  </nav>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<div class="modal-back" id="confirm-modal" hidden>
+  <div class="modal-box">
+    <div class="confirm-title" id="cf-title"></div>
+    <div class="confirm-msg" id="cf-msg"></div>
+    <div class="confirm-actions">
+      <button class="btn" id="cf-cancel">取消</button>
+      <button class="btn danger" id="cf-ok">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 规则编辑器 ============
+     学 NovaSched 的 showRuleEditor: 点规则行进编辑,
+     包名 + 档位 chips + 删除, 而不是弹原生 confirm。 -->
+<div class="modal-back" id="rule-modal" hidden>
+  <div class="modal-box rule-editor">
+    <div class="eyebrow" id="rule-eyebrow">新建规则</div>
+    <div class="confirm-title" id="rule-title">添加应用策略</div>
+    <div class="field">
+      <label class="lbl" for="rule-pkg">应用包名</label>
+      <input class="inp" id="rule-pkg" placeholder="com.tencent.tmgp.sgame"
+             autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="255">
+      <button class="btn block" id="rule-pick" type="button" hidden>从应用库选择…</button>
+      <div class="rule-pick-panel" id="rule-pick-panel" hidden>
+        <input class="inp" id="rule-pick-search" placeholder="搜索包名或应用名">
+        <div class="rule-list" id="rule-pick-list"></div>
+      </div>
+      <p class="desc" id="rule-error" hidden></p>
+    </div>
+    <div class="field">
+      <label class="lbl">目标档位</label>
+      <div class="mode-chips" id="rule-chips" role="group" aria-label="目标档位"></div>
+      <p class="desc">应用在前台时按这个档位跑；不设的沿用默认。</p>
+    </div>
+    <div class="confirm-actions">
+      <button class="btn" id="rule-cancel">取消</button>
+      <button class="btn" id="rule-save">保存策略</button>
+    </div>
+    <button class="danger-link" id="rule-delete" type="button" hidden>删除这条策略</button>
+  </div>
+</div>
+
+<script src="host.js?v=3"></script>
+<script src="glass-liquid.js?v=3"></script>
+<script src="app.js?v=3"></script>
+</body>
+</html>

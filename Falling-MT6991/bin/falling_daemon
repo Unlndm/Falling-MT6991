@@ -1,0 +1,557 @@
+#!/system/bin/sh
+# ============================================================
+# Falling-MT6991 守护进程 (v2.0 全智能)
+#
+# 每 5s: 屏态/前台应用 -> 游戏判定 -> 智能档位决策 -> 变化才应用
+# 用户不需要选场景/档位/帧率守护: 档位由 lib/smart.sh 按
+# 温度 / 负载 / 帧率 / 前台应用 / 屏态 自动决定。
+#
+# 决策链(自上而下覆盖):
+#   息屏极限省电  >  游戏  >  应用策略(apps.conf)  >  智能评分
+#      游戏怎么调度由 system.conf 的 game_mode 决定:
+#        game_mode=official  交官方 HyperBoost/风驰, 模块整体让路(默认)
+#        game_mode=module    模块接管, game_medium 保底, 低帧/满载升 performance
+#
+# 规则:
+#   - 状态变化才应用(避免重复写 sysfs); 300s 周期重申静默对抗系统重置
+#   - 应用失败退避 30s: 档位文件缺失/节点不可写时不再每 5s 刷一次日志
+#   - 息屏时轮询降到 15s: 后台没有前台应用, 5s 一轮纯浪费电
+# 开销(实机实测 PLC110/ColorOS15):
+#   - 前台包/屏态走 logcat events 事件驱动, 主循环只读小文件(零 fork)
+#   - 温度/整机忙时/分簇忙时/帧率全部由 lib/metrics.sh 一次内建采集, 零 fork
+#   - 单实例锁(mkdir) + 心跳文件, 由 service.sh 的父循环负责崩溃重启
+# ============================================================
+PMK_DATA_DIR="${PMK_DATA_DIR:-/data/adb/modules/falling-mt6991}"
+# system/bin 与 bin 两条启动路径都要落到模块根
+_self=$(dirname "$0")
+if [ -d "$PMK_DATA_DIR/lib" ]; then
+  MODDIR="$PMK_DATA_DIR"
+elif [ -d "$_self/../lib" ]; then
+  MODDIR="$_self/.."
+elif [ -d "$_self/../../lib" ]; then
+  MODDIR="$_self/../.."
+else
+  MODDIR="$_self/.."
+fi
+# shellcheck disable=SC1091
+[ -f "$MODDIR/lib/common.sh" ] && . "$MODDIR/lib/common.sh"
+. "$MODDIR/lib/governor.sh" 2>/dev/null
+. "$MODDIR/lib/notify.sh" 2>/dev/null
+. "$MODDIR/lib/touch.sh" 2>/dev/null
+. "$MODDIR/lib/apply.sh" 2>/dev/null
+. "$MODDIR/lib/metrics.sh" 2>/dev/null
+. "$MODDIR/lib/smart.sh" 2>/dev/null
+. "$MODDIR/lib/thermal.sh" 2>/dev/null
+. "$MODDIR/lib/loop.sh" 2>/dev/null
+. "$MODDIR/lib/extreme.sh" 2>/dev/null
+
+runtime_dir
+# common.sh 没加载成功时 PMK_RUNTIME_DIR 是空的, 后面的锁/心跳会写到根目录
+[ -n "$PMK_RUNTIME_DIR" ] || { echo "falling_daemon: common.sh 未加载" >&2; exit 1; }
+
+# ---- 单实例锁: mkdir 是原子的, 比 pidfile 竞争安全 ----
+# 两个守护同时跑会互相对抗(一个刚降档另一个升回去), 且双倍写 sysfs。
+# 锁目录里放 pid, 进程已死则抢占, 避免残留锁把模块永久锁死。
+D_LOCK="$PMK_RUNTIME_DIR/daemon.lock"
+if ! mkdir "$D_LOCK" 2>/dev/null; then
+  old=""
+  read -r old < "$D_LOCK/pid" 2>/dev/null
+  if [ -n "$old" ] && [ -d "/proc/$old" ]; then
+    exit 0
+  fi
+  rm -rf "$D_LOCK" 2>/dev/null
+  mkdir "$D_LOCK" 2>/dev/null || exit 0
+fi
+echo "$$" > "$D_LOCK/pid" 2>/dev/null
+D_START=$(date +%s)
+unlock_daemon() { rm -rf "$D_LOCK" 2>/dev/null; }
+
+
+# 应用策略统一在 apps.conf (格式: 包名=档位 | 包名@touch=采样率码)
+APPCONF="$PMK_CONFIG_DIR/apps.conf"
+[ -f "$APPCONF" ] || { log_err "daemon: apps.conf missing"; exit 1; }
+
+# 息屏档位(默认极限省电; 兼容旧配置里手写的 SCREEN_OFF_PROFILE)
+screen_off_profile() {
+  local p=""
+  p=$(grep -m1 '^SCREEN_OFF_PROFILE=' "$APPCONF" 2>/dev/null | cut -d= -f2-)
+  [ -n "$p" ] || p=powersave+
+  echo "$p"
+}
+
+# 包名 -> 档位 (apps.conf 中 "包名=档位" 行, 跳过 @touch 行)
+# 每轮都要调用, 用内建 read 扫(零 fork); 命中结果放 APP_PROFILE
+app_profile() {
+  APP_PROFILE=""
+  local pkg="$1" line
+  [ -n "$pkg" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "$pkg="*) APP_PROFILE="${line#*=}"; break ;;
+    esac
+  done < "$APPCONF" 2>/dev/null
+  [ -n "$APP_PROFILE" ]
+}
+
+# ============================================================
+# 前台包 / 屏态: logcat events 事件驱动(替代每轮两次 dumpsys)
+#   - wm_set_resumed_activity 载荷含包名; screen_toggled 输出 1/0
+#   - 成本: dumpsys activity top ~900ms/次, 内建 read ~0.2ms
+#   - 事件流不可用时自动回退 dumpsys, 可自愈
+#   - 亮度节点(息屏读到 1 而非 0)量级不可靠, 不作为屏态判定依据
+# ============================================================
+FG_PKG_FILE="$PMK_RUNTIME_DIR/foreground.pkg"
+SCR_ON_FILE="$PMK_RUNTIME_DIR/screen.on"
+FG_EV_FLAG="$PMK_RUNTIME_DIR/fg_watch.on"
+FG_EV_PID=""
+FG_EV_PAT='logcat -b events -s wm_set_resumed_activity'
+
+fg_watch_loop() {
+  local line pkg v
+  while [ -f "$FG_EV_FLAG" ]; do
+    logcat -b events -s wm_set_resumed_activity:I screen_toggled:I 2>/dev/null \
+    | while IFS= read -r line; do
+      case "$line" in
+        *wm_set_resumed_activity:*)
+          pkg=$(printf '%s' "$line" | sed -n 's/.*wm_set_resumed_activity: \[[0-9]*,\([^/]*\)\/.*/\1/p')
+          case "$pkg" in ''|*[!A-Za-z0-9._]*) continue ;; esac
+          printf '%s' "$pkg" > "$FG_PKG_FILE.t" 2>/dev/null \
+            && mv -f "$FG_PKG_FILE.t" "$FG_PKG_FILE" 2>/dev/null
+          ;;
+        *screen_toggled:*)
+          v="${line##*screen_toggled: }"
+          v="${v%% *}"
+          if [ "$v" = "1" ]; then printf '1' > "$SCR_ON_FILE.t"; else printf '0' > "$SCR_ON_FILE.t"; fi
+          mv -f "$SCR_ON_FILE.t" "$SCR_ON_FILE" 2>/dev/null
+          ;;
+      esac
+    done
+    [ -f "$FG_EV_FLAG" ] || break
+    sleep 2
+  done
+}
+
+fg_watch_start() {
+  runtime_dir
+  : > "$FG_EV_FLAG" 2>/dev/null
+  fg_watch_loop &
+  FG_EV_PID=$!
+}
+
+fg_watch_stop() {
+  rm -f "$FG_EV_FLAG" "$FG_PKG_FILE.t" "$SCR_ON_FILE.t" 2>/dev/null
+  [ -n "$FG_EV_PID" ] && kill "$FG_EV_PID" 2>/dev/null
+  pkill -f "$FG_EV_PAT" 2>/dev/null
+  FG_EV_PID=""
+}
+
+# 屏态: 事件文件(零 fork) -> dumpsys power 回退
+screen_on() {
+  local v=""
+  read -r v < "$SCR_ON_FILE" 2>/dev/null
+  [ "$v" = "0" ] && return 1
+  [ "$v" = "1" ] && return 0
+  case "$(dumpsys power 2>/dev/null | grep -o 'mWakefulness=[A-Za-z]*')" in
+    *Asleep*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# 前台应用包名: 事件文件(零 fork) -> dumpsys activity 回退(失败节流防拖慢循环)
+FG_FAIL=0 FG_PKG=""
+foreground_pkg() {
+  local out=""
+  read -r out < "$FG_PKG_FILE" 2>/dev/null
+  case "$out" in ''|*[!A-Za-z0-9._]*) out="" ;; esac
+  if [ -n "$out" ]; then
+    FG_PKG="$out"; FG_FAIL=0
+    echo "$out"
+    return 0
+  fi
+  if [ "$FG_FAIL" -ge 5 ]; then
+    echo "$FG_PKG"
+    return 0
+  fi
+  out=$(dumpsys activity top 2>/dev/null \
+    | grep -m1 '^ACTIVITY ' \
+    | sed -n 's/.* \([^/ ]*\)\/.*/\1/p')
+  [ -n "$out" ] || out=$(dumpsys activity activities 2>/dev/null \
+    | grep -m1 'topResumedActivity' \
+    | sed -n 's/.* u0 \([^/ ]*\).*/\1/p')
+  if [ -n "$out" ]; then
+    FG_PKG="$out"; FG_FAIL=0
+    echo "$out"
+  else
+    FG_FAIL=$((FG_FAIL+1))
+    echo "$FG_PKG"
+  fi
+}
+
+# LaunchBoost: 前台切换瞬时升频(仅 boost_up 触发, 短 duration 防功耗爆炸)
+launch_boost() {
+  [ -f /proc/touch_boost/boost_up ] || return 0
+  write_file /proc/touch_boost/boost_duration 40 2>/dev/null
+  write_file /proc/touch_boost/boost_up 1 2>/dev/null
+  log_debug "launch_boost: 前台切换, 瞬时 CPU 升频 40ms"
+}
+
+# 控制链快照: WebUI 用它显示「谁在改 CPU」
+# 内容没变就不重写(让路期间每轮都是同一份, 没必要每 5s 写一次 tmpfs)
+LAST_CTRL=""
+write_control() {
+  runtime_dir
+  local sig="$1|$2|$3|$4"
+  [ "$sig" = "$LAST_CTRL" ] && return 0
+  LAST_CTRL="$sig"
+  cat > "$PMK_CONTROL_FILE" 2>/dev/null <<EOF
+layer=$1
+pkg=$2
+profile=$3
+screen=$4
+mode=smart
+EOF
+}
+
+# ---- 游戏包名名单(用户自填; 来源 config/触控.md 的 游戏包名=) ----
+GAME_PKGS=""
+GAME_LIST_TICK=0
+
+load_game_pkgs() {
+  GAME_PKGS=""
+  local tpkgs pkg
+  tpkgs=$(grep -m1 '^游戏包名=' "$PMK_CONFIG_DIR/触控.md" 2>/dev/null | cut -d= -f2-)
+  for pkg in $(printf '%s' "$tpkgs" | tr ',' ' '); do
+    [ -n "$pkg" ] || continue
+    case " $GAME_PKGS " in *" $pkg "*) ;; *) GAME_PKGS="$GAME_PKGS $pkg" ;; esac
+  done
+  GAME_PKGS="${GAME_PKGS# }"
+}
+
+game_hit() {
+  [ -n "$GAME_PKGS" ] || return 1
+  if [ -n "$1" ]; then
+    case " $GAME_PKGS " in *" $1 "*) return 0 ;; esac
+  fi
+  pidof $GAME_PKGS >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# 息屏时判断游戏进程是否还活着(前台包名拿不到, 只能靠进程存活)。
+# 用途: 极致省电限制层的游戏豁免 —— 息屏期间游戏在后台跑, 也不能对它上极限省电。
+game_alive() {
+  [ -n "$GAME_PKGS" ] || return 1
+  pidof $GAME_PKGS >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# 游戏调度模式: official=交官方让路 / module=模块接管
+# 每 20s 重读一次(system.conf 改完不用重启守护), 非法值一律按 official
+GAME_MODE=official
+GAME_MODE_TICK=0
+GAME_MISS=0
+GAME_ON=0
+GAME_MISS_MAX=3   # 退出游戏要连续 3 轮(15s)未命中, 防切后台瞬间反复换档
+
+load_game_mode() {
+  cfg_get game_mode
+  case "$_CFG_VAL" in
+    module) GAME_MODE=module ;;
+    *)      GAME_MODE=official ;;
+  esac
+}
+
+# ---- 极致省电限制层 (v3.4.0) ----
+# 用户开关(system.conf 的 extreme), 每 20s 重读一次(与 game_mode 同节奏)。
+# 最终生效态还要看游戏: 游戏期间限制层一律失效。
+EXTREME_SWITCH=0
+EXTREME_SWITCH_TICK=0
+EXTREME_TICK=0
+
+load_extreme_switch() {
+  cfg_get extreme
+  case "$_CFG_VAL" in
+    1) EXTREME_SWITCH=1 ;;
+    *)  EXTREME_SWITCH=0 ;;
+  esac
+}
+
+# 发布限制层状态 + 处理状态翻转
+# $1=游戏进行中(0|1), $2=要还原的档位(默认当前生效档位)
+extreme_update() {
+  local game="$1" prof="${2:-$last_p}"
+  extreme_publish "$game" "$EXTREME_SWITCH"
+  # 状态翻转: 需要重新落盘档位值(CPU/GPU/CM 钳制)并还原/重设执行器节奏
+  if [ "$EXTREME_CHANGED" = 1 ]; then
+    EXTREME_CHANGED=0
+    if [ "$EXTREME_ON" = 0 ]; then
+      # 限制层退出: 执行器节点(升频节奏/boost 阈值)照出厂值写回,
+      # 非 CPU 节点(GPU/cm_mgr/c2ps)照档位原值写回。
+      # 不还原的话: 关掉开关后 CPU 升不上去; 进游戏时 GPU 还钉在最低频。
+      loop_restore_extreme
+      [ -n "$prof" ] && apply_profile_non_cpu "$prof" 2>/dev/null
+    fi
+    log_info "extreme: 限制层状态翻转, 触发重新落盘 (game=$game)"
+    EXTREME_REAPPLY=1
+  fi
+}
+
+touch_load 2>/dev/null
+
+# 调度层状态快照(供 WebUI 读取)
+write_sched_state() {
+  runtime_dir
+  local v_prof v_pelt v_uclamp v_bup v_bdur v_energy v_bta v_iso
+  local v_parh v_parl v_misfit v_slim v_isoh v_isol v_scx v_swalt
+  local v_drift v_bad v_rt v_umax
+  read -r v_prof   < "$PMK_CONFIG_DIR/sched_profile" 2>/dev/null
+  read -r v_drift  < "$PMK_RUNTIME_DIR/sched.drift" 2>/dev/null
+  read -r v_bad    < "$PMK_RUNTIME_DIR/sched.badcount" 2>/dev/null
+  read -r v_pelt   < /proc/sys/kernel/sched_pelt_multiplier 2>/dev/null
+  read -r v_uclamp < /proc/hmbird_sched/uclamp_ctrl 2>/dev/null
+  read -r v_bup    < /proc/touch_boost/boost_up 2>/dev/null
+  read -r v_bdur   < /proc/touch_boost/boost_duration 2>/dev/null
+  read -r v_energy < /proc/sys/kernel/sched_energy_aware 2>/dev/null
+  read -r v_bta    < /proc/touch_boost/boost_ta 2>/dev/null
+  read -r v_iso    < /proc/hmbird_sched/isolate_ctrl 2>/dev/null
+  read -r v_parh   < /proc/hmbird_sched/parctrl_high_ratio 2>/dev/null
+  read -r v_parl   < /proc/hmbird_sched/parctrl_low_ratio 2>/dev/null
+  read -r v_misfit < /proc/hmbird_sched/misfit_ds 2>/dev/null
+  read -r v_slim   < /proc/hmbird_sched/slim_for_app 2>/dev/null
+  read -r v_isoh   < /proc/hmbird_sched/isoctrl_high_ratio 2>/dev/null
+  read -r v_isol   < /proc/hmbird_sched/isoctrl_low_ratio 2>/dev/null
+  read -r v_scx    < /proc/hmbird_sched/slim_freq_gov/scx_gov_ctrl 2>/dev/null
+  read -r v_swalt  < /proc/hmbird_sched/slim_walt/slim_walt_ctrl 2>/dev/null
+  read -r v_rt     < /proc/sys/kernel/sched_rt_runtime_us 2>/dev/null
+  read -r v_umax   < /proc/sys/kernel/sched_util_clamp_max 2>/dev/null
+  local v_tr="${TH_RATIO:-100}"
+  local v_up="$(( $(date +%s) - D_START ))"
+  cat > "$PMK_RUNTIME_DIR/sched.state" 2>/dev/null <<EOF
+profile=$v_prof
+drift=${v_drift:-0}
+bad=${v_bad:-0}
+pelt=$v_pelt
+uclamp_ctrl=$v_uclamp
+touch_boost=$v_bup/$v_bdur
+cfs_energy_aware=$v_energy
+boost_ta=$v_bta
+hmbird_isolate=$v_iso
+hmbird_parctrl=$v_parh/$v_parl
+hmbird_misfit=$v_misfit
+hmbird_slim=$v_slim
+isoctrl=$v_isoh/$v_isol
+scx_gov_ctrl=$v_scx
+slim_walt=$v_swalt
+rt_runtime=$v_rt
+uclamp_max=$v_umax
+thermal_ratio=$v_tr
+daemon_uptime=$v_up
+daemon_pid=$$
+led_layer=$LAY_ROUTE
+cluster0=${MET_CL0:--1}
+cluster1=${MET_CL1:--1}
+cluster2=${MET_CL2:--1}
+prime=${SM_PRIME:--1}
+EOF
+}
+
+# ---- 状态机初始态 ----
+last_screen="" last_p="" last_t=0
+sched_state_tick=0
+last_pkg=""
+last_reason=""
+apply_gate=0
+LAY_ROUTE=0
+SCREEN_OFF_P=$(screen_off_profile)
+EXTREME_REAPPLY=0
+
+load_game_pkgs 2>/dev/null
+load_game_mode
+load_extreme_switch
+
+trap 'fg_watch_stop; unlock_daemon' EXIT
+trap 'fg_watch_stop; unlock_daemon; exit 0' TERM INT
+fg_watch_start
+
+while :; do
+  now=$(date +%s)
+  printf '%s %s\n' "$$" "$((now - D_START))" > "$PMK_RUNTIME_DIR/daemon.alive" 2>/dev/null
+  sched_state_tick=$((sched_state_tick + 1))
+  if [ $((sched_state_tick % 2)) -eq 0 ]; then
+    write_sched_state 2>/dev/null
+  fi
+
+  # v3.1: 主进程采集一次信号(闭环层与遥测都要用)。
+  #   PMK_MET_READY=1 让 smart_decide(子进程)复用同一份数据 ——
+  #   否则子进程会再采一次, met_cpu 拿刚写的 cpu.sample 基线算差值,
+  #   busy 直接变 -1(等于"没负载")。
+  MET_DONE=0
+  met_collect 2>/dev/null
+  PMK_MET_READY=1
+  smart_prime_busy 2>/dev/null
+
+  # 配置类开关统一在这里刷新(与屏态无关, 两个分支都要用):
+  #   游戏名单 60s 一次 / 游戏调度归属与极致省电开关 20s 一次
+  if [ $((now - GAME_LIST_TICK)) -ge 60 ]; then
+    GAME_LIST_TICK=$now
+    load_game_pkgs
+  fi
+  if [ $((now - GAME_MODE_TICK)) -ge 20 ]; then
+    GAME_MODE_TICK=$now
+    load_game_mode
+  fi
+  if [ $((now - EXTREME_TICK)) -ge 20 ]; then
+    EXTREME_TICK=$now
+    load_extreme_switch
+  fi
+
+  if ! screen_on; then
+    # ===== 息屏: 极限省电 =====
+    # 极致省电限制层: 息屏时前台包名拿不到, 只能用进程存活判断游戏。
+    # 游戏在后台跑时也不能对它上极限省电(产品硬规则)。
+    if game_alive; then
+      extreme_update 1
+    else
+      extreme_update 0
+    fi
+    if [ "$last_screen" != off ]; then
+      last_screen=off
+      GAME_ON=0; GAME_MISS="$GAME_MISS_MAX"
+      LAY_ROUTE=0
+      SCREEN_OFF_P=$(screen_off_profile)
+      want=$(smart_decide "" 0 "" "$now" "$SCREEN_OFF_P" 2>/dev/null)
+      [ -n "$want" ] || want="$SCREEN_OFF_P"
+      sys_apply "$want" 2>/dev/null
+      last_p="$want"; last_t=$now
+      log_info "daemon: 息屏 -> $want"
+      write_control screen_off "" "$want" off
+    elif [ "$EXTREME_REAPPLY" = 1 ]; then
+      # 息屏期间限制层状态翻转(开关改了/后台游戏起了): 重新落盘一次
+      EXTREME_REAPPLY=0
+      sys_apply "$last_p" 2>/dev/null
+      last_t=$now
+      log_info "daemon: 息屏 -> 极致省电状态翻转, 重新落盘 $last_p"
+    fi
+  else
+    if [ "$last_screen" != on ]; then
+      last_screen=on
+      FG_FAIL=0
+      log_info "daemon: 屏幕点亮"
+    fi
+
+    pkg=$(foreground_pkg)
+
+    # 游戏判定: 名单命中或游戏进程存活 -> 进入; 退出要连续 3 轮未命中(迟滞)
+    if game_hit "$pkg"; then
+      GAME_MISS=0
+      GAME_ON=1
+    elif [ "$GAME_ON" = 1 ] && [ "$GAME_MISS" -lt "$GAME_MISS_MAX" ]; then
+      GAME_MISS=$((GAME_MISS + 1))
+    else
+      GAME_ON=0
+    fi
+    # 极致省电限制层: 游戏期间一律失效(产品硬规则: 游戏不做极限省电)
+    extreme_update "$GAME_ON"
+    # 官方风驰已接管时, 无论选哪种模式都不该再写 governor(apply_cpu 内已有守卫,
+    # 这里只用于让 UI 与日志说清楚谁在管)
+    oem_scx=0
+    official_scx_active && oem_scx=1
+
+    LAY_ROUTE=0
+    if [ "$GAME_ON" = 1 ] && [ "$GAME_MODE" = official ]; then
+      LAY_ROUTE=1
+      # 让路期间模块彻底不碰 CPU, 所以"重新落盘"在这里没有意义 ——
+      # 限频上限由 cap_release 解除, 执行器节点已由 extreme_update 还原出厂。
+      # 清掉重应用标记, 否则退出游戏后会被当成状态翻转再落一次盘。
+      EXTREME_REAPPLY=0
+      # ===== 游戏让路: 交官方调度, 模块彻底不碰 CPU =====
+      if [ -n "$last_p" ]; then
+        # 1) 解除自己写的频率上限 —— 只是"不再写"是半让路,
+        #    之前写的 scaling_max_freq 还留在节点上, 会压住官方风驰。
+        cap_release 2>/dev/null
+        # 2) 把调度层还原成出厂, 避免模块写的 PELT/hmbird 参数和官方风驰叠加
+        if [ -f "$MODDIR/lib/sched.sh" ]; then
+          MODDIR="$MODDIR" PMK_DATA_DIR="$PMK_DATA_DIR" PMK_CONFIG_DIR="$PMK_CONFIG_DIR" \
+            sh "$MODDIR/lib/sched.sh" reset 2>/dev/null
+        fi
+        log_info "daemon: 游戏让路(官方调度), 频率上限已解除 + 调度层已还原出厂"
+      fi
+      last_p=""
+      log_debug "cycle: 游戏让路(官方调度), 不碰 CPU (pkg=$pkg scx=$oem_scx)"
+      write_control oem_game "$pkg" "-" on
+    else
+      # LaunchBoost: 前台包切换 -> 触发一次内核升频
+      if [ -n "$pkg" ] && [ "$pkg" != "$last_pkg" ]; then
+        last_pkg="$pkg"
+        launch_boost 2>/dev/null
+      fi
+
+      # ===== 智能档位决策 =====
+      # 游戏(模块调度)时不再看应用策略: 游戏一律走 game 分支, 由 smart.sh 保底
+      game_flag=0
+      hint=""
+      if [ "$GAME_ON" = 1 ]; then
+        game_flag=1
+      elif app_profile "$pkg" 2>/dev/null; then
+        hint="$APP_PROFILE"
+      fi
+      want=$(smart_decide "$pkg" 1 "$hint" "$now" "$SCREEN_OFF_P" "$game_flag" 2>/dev/null)
+      [ -n "$want" ] || want=balanced
+
+      if [ "$want" != "$last_p" ] || [ "$EXTREME_REAPPLY" = 1 ]; then
+        EXTREME_REAPPLY=0
+        if [ "$now" -lt "$apply_gate" ]; then
+          : # 失败退避中, 不做任何事(否则每轮失败会连日志一起刷)
+        elif sys_apply "$want" 2>/dev/null; then
+          last_p="$want"; last_t=$now
+          reason=$(sed -n 's/^reason=//p' "$PMK_RUNTIME_DIR/smart.state" 2>/dev/null)
+          log_info "daemon: 智能档位 -> $want ($reason, pkg=$pkg game=$game_flag)"
+          [ "$reason" != "$last_reason" ] && send_notification "falling-smart" "智能调度" "$want · $reason"
+          last_reason="$reason"
+          write_control smart "$pkg" "$want" on
+        else
+          # 应用失败(节点不可写/档位文件缺失): 退避 30s, 不再每 5s 重试刷日志
+          apply_gate=$((now + 30))
+          log_err "daemon: 应用 $want 失败, 30s 后重试"
+        fi
+      elif [ $((now - last_t)) -gt 300 ]; then
+        # 周期重申: 静默对抗系统重置
+        sys_apply "$want" 2>/dev/null
+        last_t=$now
+        log_debug "daemon: 周期重申 $want (静默)"
+      fi
+
+    fi
+
+    # 触控采样率(采样率 != CPU 调度; 游戏判定由 touch.sh 读 触控.md 自行完成)
+    [ -n "$pkg" ] && touch_tick "$pkg" 2>/dev/null
+  fi
+
+    # 温控硬保护: 55°C 以上按比例压频率上限(与智能档位互补)
+    # 让路(官方调度)期间不主动压上限, 免得和官方风驰抢同一个节点;
+    # 但 >=70°C 仍然兜底 —— 安全优先于"不干预"
+    if [ "$LAY_ROUTE" = 1 ]; then
+      thermal_max_temp >/dev/null
+      thermal_ratio_set "$TH_TEMP" >/dev/null   # 让路也要更新显示用的比例(不写节点)
+      if [ "${TH_TEMP:-0}" -ge 70000 ] 2>/dev/null; then
+        # 兜底: 让路期间极高温, 临时压一次上限保命
+        cap_emergency_throttle "$TH_RATIO" 2>/dev/null
+      fi
+    else
+      thermal_tune 2>/dev/null
+    fi
+
+    # v3.1 帧率闭环: 按帧率达标率 + 大核占用 + 温度算追帧压力,
+    #   驱动执行器档位(sugov_ext 速率 + hmbird 阈值)并落盘频率上限。
+    #   让路期间不跑(上限已解除, 且不该跟官方风驰抢)。
+    if [ "$LAY_ROUTE" != 1 ]; then
+      cap_target=""
+      read -r cap_target < "$PMK_RUNTIME_DIR/cap.target" 2>/dev/null
+      if [ -n "$cap_target" ]; then
+        loop_tick "$cap_target" "${TH_RATIO:-100}" "${MET_FPS:--1}" \
+                  "${SM_PRIME:--1}" "${MET_TEMP:-0}" "$now" 2>/dev/null
+      fi
+    fi
+
+    # 息屏后没有前台应用可跟, 15s 一轮足够; 亮屏保持 5s 响应
+    if [ "$last_screen" = off ]; then sleep 15; else sleep 5; fi
+done

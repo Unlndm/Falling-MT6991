@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<config>
+    <prjname>24813</prjname>
+    
+    <!-- memory 24g -->
+    <memory_24g>
+        <zram0>
+            <disk_size_mb>10240</disk_size_mb>
+            <increase_limit>0</increase_limit>
+            <comp_algorithm>lz4</comp_algorithm>
+            <limit_size>0</limit_size>
+        </zram0>
+        <zram_opt>
+            <vm_swappiness>160</vm_swappiness>
+            <direct_swappiness>60</direct_swappiness>
+        </zram_opt>
+    </memory_24g>
+    
+    <!-- memory 16g -->
+    <memory_16g>
+        <zram0>
+            <disk_size_mb>16384</disk_size_mb>
+            <increase_limit>0</increase_limit>
+            <comp_algorithm>lz4</comp_algorithm>
+            <limit_size>0</limit_size>
+        </zram0>
+        <zram_opt>
+            <vm_swappiness>160</vm_swappiness>
+            <direct_swappiness>160</direct_swappiness>
+        </zram_opt>
+    </memory_16g>
+    
+    <!-- memory 12g -->
+    <memory_12g>
+        <zram0>
+            <disk_size_mb>12288</disk_size_mb>
+            <increase_limit>0</increase_limit>
+            <comp_algorithm>zstd</comp_algorithm>
+            <limit_size>0</limit_size>
+        </zram0>
+        <zram_opt>
+            <vm_swappiness>160</vm_swappiness>
+            <direct_swappiness>160</direct_swappiness>
+        </zram_opt>
+    </memory_12g>
+</config>

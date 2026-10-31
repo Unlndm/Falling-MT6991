@@ -1,0 +1,72 @@
+/* ============================================================
+   液态玻璃材质层 (Liquid Glass) · v3 — WebGL 版
+   ============================================================
+   移植自 NovaSched-Zen-Edition 的 app.css 玻璃段落。
+   它的做法: 一块 WebGL stage 渲染全部玻璃面, 每块玻璃在自己的
+   元素里放一张 <canvas class="glass-surface">, 画的是「折射后的
+   背景 + 圆角遮罩 + 色散 + 边缘高光」。
+
+   相比 v2 的 CSS/SVG 滤镜方案:
+     - v2 每块玻璃一个 backdrop-filter + 一个 SVG feTurbulence 位移滤镜,
+       30+ 玻璃面同时存在时, 每帧都要重新光栅化滤镜, 在 Android
+       WebView 上是「设置页特别卡」的主因。
+     - v3 只用一次 GPU 绘制, 静止时零重绘。
+
+   CSS 只负责三件事:
+     1) 桌面上的角色分级(材质由 shader 决定, 这里给未就绪时的兜底色)
+     2) .glass-surface 画布的定位
+     3) WebGL 不可用时的纯 CSS 降级
+   ============================================================ */
+
+/* ---------- 玻璃表面画布 ---------- */
+/* 每个 .g 元素里由脚本插入一张 canvas, 尺寸与元素一致。
+   z-index:-1 让它落在内容之下, 但仍在 .g 的 overflow:hidden 裁切内。 */
+.glass-surface {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  z-index: -1; pointer-events: none;
+}
+/* WebGL 就绪后, .g 自身的半透明底色必须让位给画布, 否则两层叠加发灰 */
+.g.glass-ready { background: transparent; }
+
+/* ---------- 背景墙 ---------- */
+/* #glass-canvas 是脚本绘制壁纸渐变的画布, 位于最底层 */
+#glass-canvas {
+  position: fixed; inset: 0;
+  width: 100%; height: 100%;
+  z-index: 0; pointer-events: none;
+}
+
+/* ---------- 角色兜底色 ----------
+   这些色值在 WebGL 就绪时会被脚本用 --surface-color 覆盖。
+   WebGL 不可用(老宿主/无 GPU)时, 它们就是最终呈现。 */
+:root {
+  --glass-card-tint: rgba(138, 180, 248, .38);
+  --glass-panel-tint: rgba(242, 244, 248, .34);
+  --glass-pill-tint: rgba(242, 244, 248, .54);
+  --glass-settings-tint: rgba(255, 255, 255, .73);
+  --glass-accent-tint: rgba(10, 132, 255, .58);
+}
+[data-theme="dark"] {
+  --glass-card-tint: rgba(138, 180, 248, .30);
+  --glass-panel-tint: rgba(18, 18, 18, .40);
+  --glass-pill-tint: rgba(18, 18, 18, .52);
+  --glass-settings-tint: rgba(36, 36, 38, .80);
+}
+
+/* ---------- WebGL 不可用时的 CSS 降级 ----------
+   只保留一层 backdrop-filter 模糊, 不叠 SVG 位移滤镜。
+   滤镜层数是这里的关键: 一层 blur 可接受, 滤镜+位移在低端机上必卡。 */
+.glass-flat .g {
+  -webkit-backdrop-filter: blur(var(--role-blur, 12px));
+  backdrop-filter: blur(var(--role-blur, 12px));
+}
+.glass-flat .g::before,
+.glass-flat .g::after { display: none; }
+
+/* ---------- 内容层级 ----------
+   画布是 .g 的第一个子元素, z-index:-1。
+   .g 自带 isolation:isolate, 负 z-index 的子元素会画在
+   「自身背景之上、内容之下」, 所以正文天然盖在折射面上,
+   不需要给所有子元素加 position/z-index ——
+   那样会覆盖 .dock-indicator 这类绝对定位元素的定位方式。 */
