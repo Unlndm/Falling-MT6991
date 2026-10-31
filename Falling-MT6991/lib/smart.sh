@@ -35,6 +35,8 @@ MODDIR="${MODDIR:-$(dirname "$(dirname "$0")")}"
 
 SMART_STATE="$PMK_RUNTIME_DIR/smart.state"
 SMART_CNT="$PMK_RUNTIME_DIR/smart.count"    # lowc hic since
+SMART_FPSH="$PMK_RUNTIME_DIR/fps.hist"      # 最近 3 次帧率采样(去抖窗口)
+SMART_EMAF="$PMK_RUNTIME_DIR/score.ema"     # 评分 EMA(抑制来回换档)
 SMART_TRACE="$PMK_RUNTIME_DIR/smart.trace"  # 决策历史(环形)
 SMART_STATS="$PMK_RUNTIME_DIR/smart.stats"  # 档位驻留累计秒
 SMART_TRACE_MAX=240
@@ -105,6 +107,66 @@ smart_prime_busy() {
   elif [ "${MET_NCL:-0}" -eq 2 ]; then
     SM_PRIME="${MET_CL1:--1}"
   fi
+}
+
+# ---------- 信号去抖 ----------
+# 帧率: fpsgo_status 的 currentFPS 是"每渲染器瞬时值", 5s 一次采样只在
+# 100/70/60/10/2 之间跳(渲染器增删/动画起停/旋转), 单次采样直接做
+# "连续低帧 / 连续高帧"判定时, 计数会被一次抖动清零, 结果 lowc>=2 与 hic>=6
+# 两条判据几乎永远凑不齐(实机 trace 里长期 lowc=0 hic=0)。
+# 取最近 3 次采样的中位数参与判定; smart.state 仍写原始 fps, 方便 UI 对照。
+# 读不到(-1)时清空窗口并清零计数(AGENTS: 读不到就跳过, 不保留陈旧基线)。
+# 结果放 SM_FPS。
+smart_fps_win() {
+  local a b c v1 v2 t
+  SM_FPS="$1"
+  a=-1; b=-1; c=-1
+  [ -f "$SMART_FPSH" ] && read -r a b c < "$SMART_FPSH" 2>/dev/null
+  case "$a" in ''|*[!0-9]*) a=-1 ;; esac
+  case "$b" in ''|*[!0-9]*) b=-1 ;; esac
+  case "$c" in ''|*[!0-9]*) c=-1 ;; esac
+  if [ "$1" = "-1" ]; then
+    printf '%s %s %s\n' -1 -1 -1 > "$SMART_FPSH" 2>/dev/null
+    SM_FPS=-1
+    return 0
+  fi
+  # 窗口后移: 丢掉最旧的 a, 新样本进 c
+  a="$b"; b="$c"; c="$1"
+  printf '%s %s %s\n' "$a" "$b" "$c" > "$SMART_FPSH" 2>/dev/null
+  if [ "$a" -lt 0 ] && [ "$b" -lt 0 ]; then
+    SM_FPS="$c"
+  elif [ "$a" -lt 0 ] || [ "$b" -lt 0 ]; then
+    # 只有两个有效样本: 取较小值(偏保守, 宁可认为帧率还没恢复)
+    if [ "$a" -lt 0 ]; then v1="$c"; else v1="$a"; fi
+    if [ "$b" -lt 0 ]; then v2="$c"; else v2="$b"; fi
+    [ "$v1" -lt "$v2" ] 2>/dev/null && SM_FPS="$v1" || SM_FPS="$v2"
+  else
+    # 三个有效样本: 排序后取中位数(a b c 此时已写入文件, 就地换位无副作用)
+    if [ "$a" -gt "$b" ]; then t="$a"; a="$b"; b="$t"; fi
+    if [ "$b" -gt "$c" ]; then t="$b"; b="$c"; c="$t"; fi
+    if [ "$a" -gt "$b" ]; then t="$a"; a="$b"; b="$t"; fi
+    SM_FPS="$b"
+  fi
+  return 0
+}
+
+# 评分 EMA: 单轮原始分会被一个噪声信号推着跨阈值(PSI ±12 / 帧率 ±30),
+# 实机 10 分钟出现过 13 次换档。用步长 1/4 的 EMA 压掉单轮尖峰;
+# 滞回阈值 / 单次只跳一档 / 20s 驻留全部保留(EMA 只喂给滞回映射)。
+# 状态存 runtime/score.ema(单值); 首次运行没有基线时直接采用原始分。
+# 结果放 SM_SCORE。
+smart_score_ema() {
+  local raw="$1" prev="" out
+  [ -f "$SMART_EMAF" ] && read -r prev < "$SMART_EMAF" 2>/dev/null
+  case "$prev" in
+    ''|*[!0-9]*) out="$raw" ;;
+    *) out=$(( (prev * 3 + raw) / 4 )) ;;
+  esac
+  [ "$out" -lt 0 ] 2>/dev/null && out=0
+  [ "$out" -gt 100 ] 2>/dev/null && out=100
+  printf '%s\n' "$out" > "$SMART_EMAF" 2>/dev/null
+  SM_SCORE="$out"
+  return 0
 }
 
 # ---------- 遥测 ----------
@@ -179,7 +241,7 @@ smart_save() {
 smart_decide() {
   local pkg="${1:-}" on="${2:-1}" hint="${3:-}" now="${4:-0}" soff="${5:-powersave+}" game="${6:-0}"
   runtime_dir
-  local cur lowc hic since score base reason want psi psi_used
+  local cur lowc hic since score base reason want psi psi_used fps_raw
 
   cur=""; lowc=0; hic=0; since=0
   if [ -f "$SMART_CNT" ]; then
@@ -201,6 +263,8 @@ smart_decide() {
     MET_TEMP=0; MET_BUSY=-1; MET_FPS=-1; MET_PSI=-1; SM_PRIME=-1
     MET_CL0=-1; MET_CL1=-1; MET_CL2=-1; MET_NCL=0
     met_cores
+    # 息屏期间的帧率样本不可信, 清空去抖窗口, 亮屏后从新样本重新起算
+    printf '%s %s %s\n' -1 -1 -1 > "$SMART_FPSH" 2>/dev/null
     [ "$cur" != "$soff" ] && {
       smart_stats_add "$cur" $((now - since))
       smart_trace "$cur" "$soff" "息屏"
@@ -216,11 +280,15 @@ smart_decide() {
   # 其它调用路径(测试/外部脚本直接调)永远读到 0 -> 每次采新数据。
   [ "${PMK_MET_READY:-0}" = "1" ] || met_collect_reset
   met_collect
-  local t="${MET_TEMP:-0}" busy="${MET_BUSY:--1}" fps="${MET_FPS:--1}"
+  local t="${MET_TEMP:-0}" busy="${MET_BUSY:--1}" fps psi
+  fps_raw="${MET_FPS:--1}"
+  # 帧率先过 3 点中位数窗口(去抖), 再进连续计数
+  smart_fps_win "$fps_raw"
+  fps="$SM_FPS"
   psi="${MET_PSI:--1}"
   smart_prime_busy
 
-  # 帧率连续计数(只有数据有效才算)
+  # 帧率连续计数(只有数据有效才算, 用去抖后的中位数)
   # 帧率读不到时清零: 否则"上一次读到的连续低帧计数"会一直挂着,
   # 等下次有数据时立刻凑够 2 轮, 把"刚恢复"误判成"持续低帧"(AGENTS: 读不到就跳过)。
   if [ "$fps" != "-1" ]; then
@@ -325,6 +393,9 @@ smart_decide() {
   # = SM_EXIT_SAVE, 单因素就能把 powersave 翻回 balanced, 又随 PSI 回落翻回去,
   # 造成每 ~20s 一次换档抖动。+12 时 19 -> 31 不跨阈值; 真实负载靠
   # busy>=55(+10) / 大核(+4~18) / 低帧(+30) 叠加才升档, 与 PSI 分工不冲突。
+  # 阈值 20 的实机复核(PLC110, 5s 采样 60 点): 空闲 some avg10 在 8~25
+  # (多数 11~19), 压 3 路负载时 34~36。阈值 20 挡不住空闲噪声, 所以
+  # >=45 的需求下限不能去掉 —— 两个条件同时成立才算"真在排队"。
   psi_used=0
   if [ "$psi" -ge 20 ] 2>/dev/null; then
     if [ "$busy" -ge 45 ] 2>/dev/null || [ "$SM_PRIME" -ge 45 ] 2>/dev/null; then
@@ -338,7 +409,9 @@ smart_decide() {
   fi
   [ "$base" -lt 0 ] && base=0
   [ "$base" -gt 100 ] && base=100
-  score=$base
+  # 原始分先过 EMA 再进滞回映射(单轮噪声不再单独跨阈值)
+  smart_score_ema "$base"
+  score="$SM_SCORE"
 
   # 带滞回映射, 单次只跳一档
   want="$cur"

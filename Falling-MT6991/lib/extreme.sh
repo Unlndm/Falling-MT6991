@@ -27,8 +27,9 @@
 #     钳制时从表里取 "<= 目标值" 的最大真实频点, 保证写入值一定可写
 #   - sugov_ext 升降频速率语义: docs/arch-realdevice.md 实验 2/3
 #     (写 200000 -> CPU 被钉在 798000 地板; 写 10 -> 能冲到 3600000)
-#   - up_rate=50000 是上述两个实测点之间的【推断值】, 已标注待实机标定。
-#     它放在 config/profiles/extreme_overlay.conf 里, 标定后改这一个文件即可。
+#   - up_rate=50000 已实机标定(绑定 cpu7 满载, 0.2s 采样): 10000 约 0.4s 升到
+#     3400000, 50000 约 3.2s, 200000 约 6.6s。取值与结论写在
+#     config/profiles/extreme_overlay.conf 的注释里; 调参只改那一个文件。
 #   - hmbird cpuctrl_high/low 是百分比阈值(越大越晚触发 boost), 机制见
 #     config/profiles/sched_*.conf 的注释; 95/85 是本档的取值, 同样待标定。
 #

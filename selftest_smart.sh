@@ -106,7 +106,11 @@ export MODDIR="$T"          # 让 lib/smart.sh 找到 $T/lib/common.sh
 seed(){ set_pct 20 20 20; write_stat; met_cpu; }
 busy_at(){ set_pct "$1" "$2" "$3"; write_stat; }
 
-dec(){ smart_decide "$1" "$2" "$3" "$4" "${5:-}" "${6:-0}" >/dev/null 2>&1; }
+# 评分 EMA 会让连续多次决策互相影响; 除 EMA 专项用例外, 每个场景先清掉基线,
+# 让该场景从「原始分」开始(等价于首次运行), 断言才可复现。
+dec(){ : > config/runtime/score.ema; smart_decide "$1" "$2" "$3" "$4" "${5:-}" "${6:-0}" >/dev/null 2>&1; }
+# 保留 EMA 基线(评分平滑专项用例)
+dec_keep(){ smart_decide "$1" "$2" "$3" "$4" "${5:-}" "${6:-0}" >/dev/null 2>&1; }
 st(){ sed -n "s/^$1=//p" config/runtime/smart.state 2>/dev/null; }
 pof(){ sed -n 's/^profile=//p' config/runtime/smart.state 2>/dev/null; }
 
@@ -265,9 +269,9 @@ dec com.foo 1 performance 4180; ok 应用策略直通 performance "$(pof)"
 # 所以这里走「本轮信号已就绪」路径直接注入: MET_DONE=1 + PMK_MET_READY=1
 # 之后 smart_decide 里的 met_collect 会直接返回, 不再覆盖注入值
 # (这正是守护进程主进程与 smart_decide 子进程共享同一份信号的机制)。
-inject_met() {  # 温度 整机忙时 大核忙时 争用
+inject_met() {  # 温度 整机忙时 大核忙时 争用 [帧率]
   MET_TEMP="$1"; MET_BUSY="$2"; MET_CL0="$2"; MET_CL1="$2"; MET_CL2="$3"
-  MET_NCL=3; MET_FPS=-1; MET_PSI="$4"; MET_DONE=1; PMK_MET_READY=1
+  MET_NCL=3; MET_FPS="${5:--1}"; MET_PSI="$4"; MET_DONE=1; PMK_MET_READY=1
 }
 
 echo "[20] CPU 争用(PSI): 有需求下限时才加分"
@@ -295,6 +299,36 @@ inject_met 44000 60 50 -1
 dec "" 1 "" 5200
 ok 争用缺失 -1 "$(st psi)"
 ok 无争用信号仍按忙时评分 balanced "$(pof)"
+
+echo "[23] 帧率去抖: 70/100 交替时按中位数仍算持续低帧"
+# 朴素逻辑: 70 -> 计数1, 100 -> 清零, 永远凑不够 lowc>=2。
+# 3 点中位数: [70] -> 70, [70,100] 取较小 -> 70, 连续两轮低 -> lowc=2。
+printf 'tendency=balance\n' > config/system.conf
+printf 'balanced\n' > config/runtime/profile.applied
+printf '0 0 0\n' > config/runtime/smart.count
+: > config/runtime/fps.hist
+inject_met 44000 40 60 -1 70
+dec "" 1 "" 6000
+ok 首轮单点低帧不升档 balanced "$(pof)"
+inject_met 44000 40 60 -1 100
+dec "" 1 "" 6010
+ok 去抖后仍判低帧 performance "$(pof)"
+ok 去抖后原因 "持续低帧, 升档" "$(st reason)"
+
+echo "[24] 评分 EMA: 单轮尖峰不单独换档, 持续高分才换"
+printf 'tendency=balance\n' > config/system.conf
+printf 'balanced\n' > config/runtime/profile.applied
+printf '0 0 0\n' > config/runtime/smart.count
+: > config/runtime/score.ema
+inject_met 44000 60 60 -1
+dec_keep "" 1 "" 7000
+ok 基线原始分 54 "$(st score)"
+inject_met 44000 100 100 -1
+dec_keep "" 1 "" 7020
+ok "尖峰后 EMA" "61" "$(st score)"
+ok 尖峰不换档 balanced "$(pof)"
+dec_keep "" 1 "" 7040
+ok "EMA 追平后升档" performance "$(pof)"
 
 echo
 [ "$FAIL" = 0 ] && echo "全部通过" || echo "失败 $FAIL 项"

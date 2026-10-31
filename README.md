@@ -4,7 +4,7 @@
 
 - 适用：MT6991 · Android 15/16 · 内核 6.6+
 - 实测机型：一加 Ace 5 至尊版（PLC110），KernelSU，SELinux Enforcing
-- 当前版本：**v3.6.1**（[更新日志](Falling-MT6991/webroot/changelog.md)）
+- 当前版本：**v3.7.0**（[更新日志](Falling-MT6991/webroot/changelog.md)）
 - 完整中文说明：[Falling-MT6991/README_zh.md](Falling-MT6991/README_zh.md)
 
 ## 功能
@@ -26,7 +26,7 @@
 
 ## 安装
 
-1. 从 [Releases](https://github.com/Unlndm/Falling-MT6991/releases) 下载 `Falling-MT6991-v3.6.1.zip`
+1. 从 [Releases](https://github.com/Unlndm/Falling-MT6991/releases) 下载 `Falling-MT6991-v3.7.0.zip`
 2. 在 Magisk / KernelSU / APatch 里刷入（检测到旧安装会问「保留 / 覆盖配置」）
 3. 按音量键选功能（后台守护 / 触控采样率 / ZRAM / 通知）
 4. 重启

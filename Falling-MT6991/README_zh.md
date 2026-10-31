@@ -3,7 +3,7 @@
 天玑 9400（MT6991）调度模块，Magisk / KernelSU / APatch 都能刷。
 
 - 适用：MT6991 · Android 15/16 · 内核 6.6+
-- 版本：v3.6.1
+- 版本：v3.7.0
 - 实测机型：一加 Ace 5 至尊版（PLC110），KernelSU，SELinux Enforcing
 - 作者：弦起悲歌赴寒江
 
